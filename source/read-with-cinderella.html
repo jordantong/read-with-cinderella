@@ -140,6 +140,10 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
 .lt{min-width:clamp(70px,11vh,104px);height:clamp(84px,13vh,124px);padding:0 8px;box-sizing:border-box;border-radius:22px;background:var(--paper);border:4px solid var(--line);
   display:grid;place-items:center;font-family:var(--read);font-weight:700;font-size:clamp(56px,9vh,92px);line-height:1;color:var(--ink);transition:transform .12s, background .12s, border-color .12s}
 .lt.on{background:var(--skySoft);border-color:var(--sky);transform:translateY(-6px) scale(1.06)}
+.word.reveal{padding-bottom:0;animation:pop .4s ease-out}
+.revealWord{font-family:var(--read);font-weight:700;font-size:clamp(56px,9vh,96px);line-height:1.1;color:var(--ink);background:var(--paper);border-radius:24px;padding:6px 28px 10px;box-shadow:0 5px 0 var(--line);animation:pop .4s ease-out}
+.revealWord b{display:inline-block;color:var(--berry);transition:transform .15s}
+.revealWord b.on{transform:scale(1.25) translateY(-4px)}
 .slideTrack{position:absolute;left:4px;right:4px;bottom:0;height:22px;display:flex;align-items:center}
 .slideTrack::before{content:"";flex:1;height:8px;border-radius:99px;background:repeating-linear-gradient(90deg,#F9A8D4 0 14px,#FDE68A 14px 28px,#86EFAC 28px 42px,#93C5FD 42px 56px,#C4B5FD 56px 70px)}
 .slideTrack::after{content:"";border:12px solid transparent;border-left:16px solid #C4B5FD;border-right:0;margin-left:-2px}
@@ -560,6 +564,7 @@ td.word .em{font-size:20px;margin-right:8px;vertical-align:-2px}
           <li><b>Vowels are the short sounds:</b> a as in apple, e as in egg, i as in itch, o as in octopus, u as in up.</li>
           <li>Each recording is 1.5 seconds, starting the moment you tap. Silence at the start and end is trimmed automatically. Hold the iPad about a foot away in a quiet room.</li>
         </ul>
+        <div class="row" style="margin-top:12px"><label style="display:flex;gap:10px;align-items:center;font-weight:700;font-size:14px">Volume of your recordings: <span id="recGainVal"></span><input type="range" id="recGain" min="0.5" max="4" step="0.25" style="width:200px"></label><button class="btn sm" id="recGainTest">Test: c… a… t</button></div>
         <div id="recBox"></div>
         <div class="sndGrid" id="sndGrid"></div>
       </div>
@@ -626,7 +631,7 @@ const TYPES=[{id:"first",name:"First Sound",desc:"Hear a sound, tap the picture 
   {id:"letter",name:"Find the Letter",desc:"Hear a sound and tap its letter, or see a letter and tap the picture that starts with it."},
   {id:"blend",name:"Unicorn Blend",desc:"Hear c… a… t in your recorded sounds and tap the picture. The key skill for her right now."},
   {id:"slide",name:"Sound Slide",desc:"Read a word: tap each letter or slide under it to hear the sounds, then tap the picture."}];
-const DEFAULTS={childName:"",buddyName:"Cinderella",perSession:8,level:1,types:{first:true,letter:true,blend:true,slide:true},letterCase:"lower",voice:"",rate:0.85};
+const DEFAULTS={childName:"",buddyName:"Cinderella",perSession:8,level:1,types:{first:true,letter:true,blend:true,slide:true},letterCase:"lower",voice:"",rate:0.85,recGain:1.5};
 const READY=3;
 
 const S={settings:{...DEFAULTS},stats:{},rewards:{gems:0},sessions:{},ready:false,mode:"loading"};
@@ -813,19 +818,29 @@ async function bufFor(g){
     if(peak<0.003){BUF.set(id,null);return null;}
     const thr=Math.max(0.015,peak*0.1);let s=0,e=d.length-1;while(s<d.length&&Math.abs(d[s])<thr)s++;while(e>s&&Math.abs(d[e])<thr)e--;
     s=Math.max(0,s-Math.round(.03*sr));e=Math.min(d.length,e+Math.round(.07*sr));
-    const len=Math.max(1,e-s),out=a.createBuffer(1,len,sr),o=out.getChannelData(0),g=Math.min(4,0.9/peak),fade=Math.round(.012*sr);
-    for(let i=0;i<len;i++){let v=d[s+i]*g;if(i<fade)v*=i/fade;else if(i>len-fade)v*=(len-i)/fade;o[i]=v;}
+    // Level by average loudness (not just the loudest instant), then soften any peaks, so quiet recordings come up to full volume.
+    const len=Math.max(1,e-s),out=a.createBuffer(1,len,sr),o=out.getChannelData(0),fade=Math.round(.012*sr);
+    let sq=0;for(let i=0;i<len;i++)sq+=d[s+i]*d[s+i];const rms=Math.sqrt(sq/len)||peak/3;
+    const g=Math.min(20,Math.max(0.9/peak,0.25/rms));
+    for(let i=0;i<len;i++){let v=d[s+i]*g;const av=Math.abs(v);if(av>.7)v=Math.sign(v)*(.7+.3*Math.tanh((av-.7)/.3));if(i<fade)v*=i/fade;else if(i>len-fade)v*=(len-i)/fade;o[i]=v;}
     BUF.set(id,out);return out;}
   catch(e){console.warn("decode",id,e);BUF.set(id,null);return null;}
 }
 const clips=new Set();
 function stopClips(){clips.forEach(c=>{try{c.stop()}catch(e){}});clips.clear();if(typeof elClips!=="undefined"){elClips.forEach(el=>{try{el.pause()}catch(e){}});elClips.clear();}}
-function playBuf(buf){return new Promise(res=>{const a=audio();if(!a||!buf){res();return;}const n=a.createBufferSource();n.buffer=buf;n.connect(a.destination);
+// Recordings play through the grown-up's volume setting and a limiter, so turning them up doesn't crackle.
+let recOut=null;
+function recBus(){const a=audio();if(!a)return null;if(!recOut||recOut.ctx!==a){const gn=a.createGain(),cp=a.createDynamicsCompressor();
+    cp.threshold.value=-8;cp.knee.value=6;cp.ratio.value=12;cp.attack.value=.002;cp.release.value=.12;gn.connect(cp);cp.connect(a.destination);recOut={ctx:a,gn};}
+  recOut.gn.gain.value=clamp(+S.settings.recGain||1.5,.5,4);return recOut.gn;}
+function playBuf(buf){return new Promise(res=>{const a=audio();if(!a||!buf){res();return;}const n=a.createBufferSource();n.buffer=buf;n.connect(recBus()||a.destination);
   clips.add(n);let done=false;const fin=()=>{if(!done){done=true;clips.delete(n);res();}};n.onended=fin;n.start();setTimeout(fin,buf.duration*1000+120);});}
 // Play one letter sound: the grown-up's recording if there is one, otherwise the voice's rough version.
 const elClips=new Set();
 function playEl(blob){return new Promise(res=>{let done=false,u="";const el=new Audio();const fin=()=>{if(!done){done=true;elClips.delete(el);try{URL.revokeObjectURL(u)}catch(e){}res();}};
-  try{u=URL.createObjectURL(blob);el.src=u;el.onended=fin;el.onerror=fin;elClips.add(el);const p=el.play();if(p&&p.catch)p.catch(fin);}catch(e){fin();}setTimeout(fin,4000);});}
+  try{u=URL.createObjectURL(blob);el.src=u;el.onended=fin;el.onerror=fin;elClips.add(el);
+    try{const a=audio(),bus=recBus();if(a&&bus)a.createMediaElementSource(el).connect(bus);}catch(e){}
+    const p=el.play();if(p&&p.catch)p.catch(fin);}catch(e){fin();}setTimeout(fin,4000);});}
 async function playSound(g){const b=await bufFor(g);if(b)return playBuf(b);const rid=recFor(g);if(rid&&!/wav/.test(REC.get(rid).type||""))return playEl(REC.get(rid));const s=SOUND_BY[(BORROW[g]||[g]).find(x=>SOUND_BY[x])];return say(s?s.tts:g,0.75);}
 // Sounds one after another, with a gap: slow (600ms) for modeling, faster to show them running together.
 async function playSounds(segs,gap,alive){for(let i=0;i<segs.length;i++){if(alive&&!alive())return;await playSound(segs[i]);if(i<segs.length-1)await wait(gap);}}
@@ -1020,8 +1035,18 @@ async function nameCards(it,gen,pre){
 function lightLetter(i){$$("#word .lt").forEach((l,j)=>l.classList.toggle("on",j===i));const star=$("#slideStar"),w=$("#word");
   if(star&&w){const l=$$("#word .lt")[i];if(l){const r=l.getBoundingClientRect(),wr=w.getBoundingClientRect();star.style.left=(r.left-wr.left+r.width/2-15)+"px";}}}
 async function soundOut(it,gen,gap){const segs=it.word.seg;
-  for(let i=0;i<segs.length;i++){if(!alive(gen))break;if(it.type==="slide")lightLetter(i);await playSound(segs[i]);if(i<segs.length-1)await wait(gap);}
-  if(it.type==="slide")setTimeout(()=>{if(alive(gen))lightLetter(-1);},250);}
+  const lit=it.type==="slide"||!!$("#word");
+  for(let i=0;i<segs.length;i++){if(!alive(gen))break;if(lit)lightLetter(i);await playSound(segs[i]);if(i<segs.length-1)await wait(gap);}
+  if(lit)setTimeout(()=>{if(alive(gen))lightLetter(-1);},250);}
+// After an answer, show the word: its first sound highlighted (First Sound, Find the Letter pictures),
+// or as letter boxes that light up with each sound (Unicorn Blend). Never shown during the question.
+function revealWord(it){const p=$("#prompt");
+  if(it.type==="blend"){p.innerHTML=`<div class="word reveal" id="word">${it.word.seg.map((x,i)=>`<span class="lt" data-s="${i}">${esc(cased(x))}</span>`).join("")}</div>`;return;}
+  if(it.type==="first"||(it.type==="letter"&&it.v==="see")){const w=it.word;
+    const n=it.type==="letter"?it.g.length:["sh","ch","th"].includes(it.sound)||(it.sound==="w"&&/^wh/.test(w))?2:1;
+    p.innerHTML=`<div class="revealWord"><b>${esc(cased(w.slice(0,n)))}</b>${esc(cased(w.slice(n)))}</div>`;}
+}
+function pulseFirst(on){const b=$(".revealWord b");if(b)b.classList.toggle("on",on);}
 async function intro(it,gen){
   if(it.type==="first"){bubble("Which one starts with this sound?");await say("Which one starts with");if(!alive(gen))return;await playSound(it.sound);await wait(400);await nameCards(it,gen);}
   else if(it.type==="letter"&&it.v==="hear"){bubble("Which letter makes this sound?");await say("Which letter says");if(!alive(gen))return;await playSound(it.g);}
@@ -1038,9 +1063,9 @@ async function replay(it,gen){
   else await soundOut(it,gen,it.type==="slide"?650:550);
 }
 async function model(it,gen){
-  if(it.type==="first"){await playSound(it.sound);await wait(200);if(alive(gen))await say(it.word+"!");}
+  if(it.type==="first"){pulseFirst(true);await playSound(it.sound);pulseFirst(false);await wait(200);if(alive(gen))await say(it.word+"!");}
   else if(it.type==="letter"&&it.v==="hear"){await say(letterName(it.g)+" says");if(alive(gen))await playSound(it.g);}
-  else if(it.type==="letter"){await playSound(it.g);await wait(200);if(alive(gen))await say(it.word+"!");}
+  else if(it.type==="letter"){pulseFirst(true);await playSound(it.g);pulseFirst(false);await wait(200);if(alive(gen))await say(it.word+"!");}
   else{await soundOut(it,gen,300);await wait(150);if(alive(gen))await say(it.word.w+"!");}
 }
 $("#hearBtn").onclick=()=>{if(!P)return;audio();const gen=++P.gen;hush();replay(P.cur,gen);};
@@ -1054,7 +1079,7 @@ async function pick(i,el){
     if(first){P.combo++;P.bestCombo=Math.max(P.bestCombo,P.combo);renderCombo(true);
       if([3,5,8].includes(P.combo)){const n=P.combo;setTimeout(()=>{banner(`${n} in a row!`);addGems(1);},600);}}
     else{P.combo=0;renderCombo();}
-    record(first?"first":"second");
+    record(first?"first":"second");revealWord(it);
     const praise=pickOne(PRAISE);bubble(praise);await say(praise);if(!alive(gen))return;
     await model(it,gen);if(!alive(gen))return;await wait(700);if(!alive(gen))return;P.idx++;nextItem();
   }else if(P.tries===0){
@@ -1064,7 +1089,7 @@ async function pick(i,el){
   }else{
     P.locked=true;el.classList.add("wrong");sfx.oops();buddy($("#buddyPlay"),"idle");
     const right=cards().find(x=>it.choices[+x.dataset.i].ok);if(right)right.classList.add("hint");
-    bubble("It's this one! We'll try it again soon.");await say("It's this one!");if(!alive(gen))return;
+    revealWord(it);bubble("It's this one! We'll try it again soon.");await say("It's this one!");if(!alive(gen))return;
     await model(it,gen);record("missed");if(!alive(gen))return;await wait(900);if(!alive(gen))return;P.idx++;nextItem();
   }
 }
@@ -1677,6 +1702,7 @@ async function recordClip(ms,onLevel){
   info.peak=Math.max(info.pcm,info.mrPeak||0);return n?wavBlob(all,a.sampleRate):null;
 }
 function renderSounds(){
+  const rg=clamp(+S.settings.recGain||1.5,.5,4);$("#recGain").value=rg;$("#recGainVal").textContent=Math.round(rg*100)+"%";
   const n=recordedCount();
   $("#sndStatus").innerHTML=`<b>${n} of ${SOUNDS.length}</b> sounds recorded. ${n<SOUNDS.length?"Until a sound is recorded, the app uses the iPad voice's rough version, which often adds an “uh.”":"All done! You can redo any of them."}${S.mode==="demo"?`<br><b style="color:var(--berryDeep)">This is the browser preview, so recordings are kept only until this tab closes. To keep them, open the app from its Home Screen icon and record there.</b>`:""}`;
   $("#sndGrid").innerHTML=SOUNDS.map(s=>{const has=hasOwnRec(s.id);
@@ -1755,6 +1781,9 @@ $("#setPer").oninput=e=>saveSettings({perSession:+e.target.value});
 $("#setCase").onchange=e=>saveSettings({letterCase:e.target.value});
 $("#setVoice").onchange=e=>saveSettings({voice:e.target.value});
 $("#setRate").oninput=e=>saveSettings({rate:+e.target.value});
+$("#recGain").oninput=e=>{saveSettings({recGain:+e.target.value});$("#recGainVal").textContent=Math.round(+e.target.value*100)+"%";if(recOut)recOut.gn.gain.value=+e.target.value;};
+$("#recGain").onchange=()=>{audio();playSound("a");};
+$("#recGainTest").onclick=()=>{hush();audio();playSounds(["c","a","t"],450);};
 $("#testVoice").onclick=()=>{hush();warmVoices();audio();(async()=>{await say(`Hi! I'm ${bname()}. Let's read. Listen:`);await playSounds(["c","a","t"],550);await say("cat!");})();};
 $("#rescanVoice").onclick=()=>{voicesWarm=false;warmVoices();setTimeout(()=>{loadVoices();toast(voices.length?`Found ${voices.length} voices`:"Still no voices. Try Test the voice, then Look again.");},900);};
 $("#giftBtn").onclick=()=>{const n=Math.max(1,Math.min(999,Math.round(+$("#giftAmt").value||0)));if(!n)return;setRewards({gems:gems()+n});sfx.win();renderSettings();renderHome();toast(`Gave ${n} gems`);};
