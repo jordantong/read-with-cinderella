@@ -1,5 +1,5 @@
 // Read with Cinderella offline cache. The version changes whenever the app files change.
-const CACHE="cind-f4be5e155c";
+const CACHE="cind-a2edd3d362";
 const ASSETS=["./", "./fonts/andika-latin-400-normal.woff2", "./fonts/andika-latin-700-normal.woff2", "./fonts/baloo-2-latin-500-normal.woff2", "./fonts/baloo-2-latin-700-normal.woff2", "./fonts/baloo-2-latin-800-normal.woff2", "./icons/apple-touch-icon.png", "./icons/icon-192.png", "./icons/icon-512.png", "./icons/icon-maskable-512.png", "./index.html", "./manifest.webmanifest"];
 self.addEventListener("install",e=>{e.waitUntil(caches.open(CACHE).then(c=>c.addAll(ASSETS)).then(()=>self.skipWaiting()));});
 self.addEventListener("activate",e=>{e.waitUntil(caches.keys().then(ks=>Promise.all(ks.filter(k=>k!==CACHE).map(k=>caches.delete(k)))).then(()=>self.clients.claim()));});

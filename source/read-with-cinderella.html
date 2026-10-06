@@ -385,6 +385,7 @@ td.word .em{font-size:20px;margin-right:8px;vertical-align:-2px}
 .recBox .ex{font-size:18px}
 .recBar{width:min(320px,90%);height:12px;border-radius:99px;background:#F7D4E6;overflow:hidden}
 .recBar i{display:block;height:100%;width:0;background:var(--berry)}
+.recBar.lvl{background:#E3F5EA}.recBar.lvl i{background:var(--leaf);transition:width .06s linear}
 @media (prefers-reduced-motion: reduce){*{animation-duration:.01ms!important;animation-iteration-count:1!important;transition:none!important}}
 </style>
 
@@ -744,7 +745,7 @@ let actx=null,recording=false;
 // iPadOS treats web audio as "ambient" sound, which Silent mode mutes. Ask for normal playback
 // (and play-and-record while the microphone is on).
 function setAudioSession(t){try{if(navigator.audioSession&&navigator.audioSession.type!==t)navigator.audioSession.type=t;}catch(e){}}
-function audio(){try{setAudioSession(recording?"play-and-record":"playback");if(!actx)actx=new (window.AudioContext||window.webkitAudioContext)();if(actx.state!=="running"&&actx.state!=="closed")actx.resume();}catch(e){}return actx;}
+function audio(){try{setAudioSession(recording?"auto":"playback");if(!actx)actx=new (window.AudioContext||window.webkitAudioContext)();if(actx.state!=="running"&&actx.state!=="closed")actx.resume();}catch(e){}return actx;}
 // Recordings are plain 16-bit WAV, which every browser can play (Safari can't always decode its own MediaRecorder files).
 function wavBlob(f32,sr){const n=f32.length,buf=new ArrayBuffer(44+n*2),v=new DataView(buf);const w=(o,t)=>{for(let i=0;i<t.length;i++)v.setUint8(o+i,t.charCodeAt(i));};
   w(0,"RIFF");v.setUint32(4,36+n*2,true);w(8,"WAVE");w(12,"fmt ");v.setUint32(16,16,true);v.setUint16(20,1,true);v.setUint16(22,1,true);v.setUint32(24,sr,true);v.setUint32(28,sr*2,true);v.setUint16(32,2,true);v.setUint16(34,16,true);w(36,"data");v.setUint32(40,n*2,true);
@@ -789,7 +790,7 @@ async function loadRecordings(){
   try{const db=await idb();await new Promise((res,rej)=>{const tx=db.transaction("sounds","readonly");const st=tx.objectStore("sounds");
       const rq=st.openCursor();rq.onsuccess=()=>{const c=rq.result;if(c){const v=c.value;
         const b=v instanceof Blob?v:v&&v.data?new Blob([v.data],{type:v.type||"audio/wav"}):null;
-        if(b&&/wav/.test(b.type))REC.set(c.key,b);else stale.push(c.key); // drop recordings from the first version, which the iPad couldn't play
+        if(b&&b.size>0)REC.set(c.key,b);
         c.continue();}else res();};rq.onerror=()=>rej(rq.error);});
     if(stale.length)await idbTx("readwrite",st=>{stale.forEach(k=>st.delete(k));});}
   catch(e){console.warn("recordings",e);}
@@ -818,11 +819,14 @@ async function bufFor(g){
   catch(e){console.warn("decode",id,e);BUF.set(id,null);return null;}
 }
 const clips=new Set();
-function stopClips(){clips.forEach(c=>{try{c.stop()}catch(e){}});clips.clear();}
+function stopClips(){clips.forEach(c=>{try{c.stop()}catch(e){}});clips.clear();if(typeof elClips!=="undefined"){elClips.forEach(el=>{try{el.pause()}catch(e){}});elClips.clear();}}
 function playBuf(buf){return new Promise(res=>{const a=audio();if(!a||!buf){res();return;}const n=a.createBufferSource();n.buffer=buf;n.connect(a.destination);
   clips.add(n);let done=false;const fin=()=>{if(!done){done=true;clips.delete(n);res();}};n.onended=fin;n.start();setTimeout(fin,buf.duration*1000+120);});}
 // Play one letter sound: the grown-up's recording if there is one, otherwise the voice's rough version.
-async function playSound(g){const b=await bufFor(g);if(b)return playBuf(b);const s=SOUND_BY[(BORROW[g]||[g]).find(x=>SOUND_BY[x])];return say(s?s.tts:g,0.75);}
+const elClips=new Set();
+function playEl(blob){return new Promise(res=>{let done=false,u="";const el=new Audio();const fin=()=>{if(!done){done=true;elClips.delete(el);try{URL.revokeObjectURL(u)}catch(e){}res();}};
+  try{u=URL.createObjectURL(blob);el.src=u;el.onended=fin;el.onerror=fin;elClips.add(el);const p=el.play();if(p&&p.catch)p.catch(fin);}catch(e){fin();}setTimeout(fin,4000);});}
+async function playSound(g){const b=await bufFor(g);if(b)return playBuf(b);const rid=recFor(g);if(rid&&!/wav/.test(REC.get(rid).type||""))return playEl(REC.get(rid));const s=SOUND_BY[(BORROW[g]||[g]).find(x=>SOUND_BY[x])];return say(s?s.tts:g,0.75);}
 // Sounds one after another, with a gap: slow (600ms) for modeling, faster to show them running together.
 async function playSounds(segs,gap,alive){for(let i=0;i<segs.length;i++){if(alive&&!alive())return;await playSound(segs[i]);if(i<segs.length-1)await wait(gap);}}
 const recordedCount=()=>SOUNDS.filter(s=>REC.has(s.id)).length;
@@ -1639,27 +1643,38 @@ function renderHistory(){
 /* ---- Recording the letter sounds ---- */
 let micStream=null,recState=null; // recState = {queue:[ids], i, phase:"ready"|"rec"|"review", blob}
 let lastClip=null,lastErr="";
-async function getMic(){if(micStream&&micStream.active)return micStream;recording=true;setAudioSession("play-and-record");
-  try{micStream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false}});}
+async function getMic(){if(micStream&&micStream.getAudioTracks().some(t=>t.readyState==="live"))return micStream;
+  recording=true;setAudioSession("auto");
+  try{micStream=await navigator.mediaDevices.getUserMedia({audio:true});}
   catch(e){recording=false;setAudioSession("playback");throw e;}return micStream;}
 function releaseMic(){if(micStream){micStream.getTracks().forEach(t=>t.stop());micStream=null;}recording=false;setAudioSession("playback");audio();}
 function stopRecorder(){recState=null;releaseMic();}
-// Capture the microphone's raw samples with Web Audio and save them as WAV. A fresh audio context per clip
-// (made right away, inside the tap) avoids iPad quirks with contexts opened before the microphone.
-async function recordClip(ms){
-  const Ctx=window.AudioContext||window.webkitAudioContext;const rc=new Ctx();try{rc.resume();}catch(e){}
-  try{const st=await getMic();if(rc.state!=="running")await rc.resume();
-    const src=rc.createMediaStreamSource(st),proc=rc.createScriptProcessor(4096,1,1),sink=rc.createGain();sink.gain.value=0;
-    const parts=[];proc.onaudioprocess=e=>parts.push(new Float32Array(e.inputBuffer.getChannelData(0)));
-    src.connect(proc);proc.connect(sink);sink.connect(rc.destination);
-    await wait(ms);
-    proc.onaudioprocess=null;try{src.disconnect();proc.disconnect();sink.disconnect();}catch(e){}
-    const n=parts.reduce((a,p)=>a+p.length,0),all=new Float32Array(n);let o=0;parts.forEach(p=>{all.set(p,o);o+=p.length;});
-    let peak=0;for(let i=0;i<n;i++){const v=Math.abs(all[i]);if(v>peak)peak=v;}
-    lastClip={secs:n/rc.sampleRate,peak,sr:rc.sampleRate,state:rc.state};
-    if(!n)throw new Error("The microphone sent no sound (audio "+rc.state+")");
-    return wavBlob(all,rc.sampleRate);}
-  finally{try{rc.close();}catch(e){}}
+async function decodeBlob(blob){const a=audio();const raw=await blob.arrayBuffer();return await new Promise((res,rej)=>{const p=a.decodeAudioData(raw,res,rej);if(p&&p.then)p.then(res,rej);});}
+const peakOf=d=>{let p=0;for(let i=0;i<d.length;i++){const v=Math.abs(d[i]);if(v>p)p=v;}return p;};
+// Two capture methods run side by side, because iPads differ in which one works:
+// (1) raw samples through Web Audio, saved as WAV; (2) the browser's own recorder.
+// Whichever actually heard something is kept. The details are shown so problems can be diagnosed.
+async function recordClip(ms,onLevel){
+  const a=audio();const st=await getMic();
+  try{if(a.state!=="running")await a.resume();}catch(e){}
+  const src=a.createMediaStreamSource(st),proc=a.createScriptProcessor(4096,1,1),sink=a.createGain(),an=a.createAnalyser();sink.gain.value=0;an.fftSize=1024;
+  const tmp=new Float32Array(an.fftSize),parts=[];proc.onaudioprocess=e=>parts.push(new Float32Array(e.inputBuffer.getChannelData(0)));
+  src.connect(an);src.connect(proc);proc.connect(sink);sink.connect(a.destination);
+  let mr=null,chunks=[],mrDone=null;
+  try{if(window.MediaRecorder){mr=new MediaRecorder(st);mr.ondataavailable=e=>{if(e.data&&e.data.size)chunks.push(e.data);};mrDone=new Promise(r=>{mr.onstop=r;mr.onerror=r;});mr.start();}}catch(e){mr=null;}
+  let live=0;const t0=performance.now();
+  while(performance.now()-t0<ms){await wait(60);try{an.getFloatTimeDomainData(tmp);const m=peakOf(tmp);live=Math.max(live,m);if(onLevel)onLevel(m);}catch(e){}}
+  proc.onaudioprocess=null;try{src.disconnect();proc.disconnect();sink.disconnect();an.disconnect();}catch(e){}
+  if(mr){try{mr.stop();}catch(e){}await Promise.race([mrDone,wait(1500)]);}
+  const n=parts.reduce((x,q)=>x+q.length,0),all=new Float32Array(n);let o=0;parts.forEach(q=>{all.set(q,o);o+=q.length;});
+  const info={secs:n/a.sampleRate,pcm:peakOf(all),live,state:a.state,mrBytes:chunks.reduce((x,c)=>x+c.size,0),mrPeak:null,mrErr:"",via:"none",peak:0};lastClip=info;
+  if(info.pcm>=0.01){info.via="samples";info.peak=info.pcm;return wavBlob(all,a.sampleRate);}
+  if(chunks.length){const blob=new Blob(chunks,{type:(mr&&mr.mimeType)||chunks[0].type||"audio/mp4"});
+    try{const buf=await decodeBlob(blob);const d=buf.getChannelData(0);info.mrPeak=peakOf(d);
+      if(info.mrPeak>=0.01){info.via="recorder";info.peak=info.mrPeak;return wavBlob(d,buf.sampleRate);}}
+    catch(e){info.mrErr=(e&&e.name)||"can't decode";info.via="recorder-file";return blob;} // kept as is; plays through an <audio> element
+  }
+  info.peak=Math.max(info.pcm,info.mrPeak||0);return n?wavBlob(all,a.sampleRate):null;
 }
 function renderSounds(){
   const n=recordedCount();
@@ -1682,8 +1697,8 @@ function renderRecBox(){
   const id=recState.queue[recState.i],s=SOUND_BY[id];
   const head=`<span class="small">${recState.queue.length>1?`Sound ${recState.i+1} of ${recState.queue.length}`:"Record one sound"}</span><div class="g">${esc(id)}</div><div class="ex">Say the sound in <b>${esc(s.ex)}</b>${s.note?` <span class="small">(${esc(s.note)})</span>`:""}</div>`;
   if(recState.phase==="ready")box.innerHTML=`<div class="recBox">${head}${lastErr?`<span class="small" style="color:var(--berryDeep)">Last try didn't work: ${esc(lastErr)}</span>`:""}<div class="row"><button class="btn rec" id="recGo">● Record (1.5 seconds)</button><button class="btn" id="recSkip">Skip</button><button class="btn" id="recStop">Stop</button></div></div>`;
-  else if(recState.phase==="rec")box.innerHTML=`<div class="recBox">${head}<b style="font-size:20px;color:var(--berryDeep)">Say it now!</b><div class="recBar"><i id="recBar"></i></div></div>`;
-  else box.innerHTML=`<div class="recBox">${head}${clipNote()}<span class="small">Did that sound right? Listen once more if you like.</span><div class="row"><button class="btn primary" id="recKeep">Sounds good${recState.i<recState.queue.length-1?" → next":""}</button><button class="btn" id="recHear">Hear it again</button><button class="btn rec" id="recRedo">Try again</button><button class="btn" id="recStop">Stop</button></div></div>`;
+  else if(recState.phase==="rec")box.innerHTML=`<div class="recBox">${head}<b style="font-size:20px;color:var(--berryDeep)">Say it now!</b><div class="recBar"><i id="recBar"></i></div><span class="small">Microphone level</span><div class="recBar lvl"><i id="lvlBar"></i></div></div>`;
+  else box.innerHTML=`<div class="recBox">${head}${clipNote()}<span class="small">Did that sound right? Listen once more if you like.</span><div class="row"><button class="btn primary" id="recKeep" ${recState.blob?"":"disabled"}>Sounds good${recState.i<recState.queue.length-1?" → next":""}</button><button class="btn" id="recHear">Hear it again</button><button class="btn rec" id="recRedo">Try again</button><button class="btn" id="recStop">Stop</button></div></div>`;
   const go=$("#recGo");if(go)go.onclick=doRecord;
   const sk=$("#recSkip");if(sk)sk.onclick=()=>advanceRec();
   const stp=$("#recStop");if(stp)stp.onclick=()=>{stopRecorder();renderSounds();};
@@ -1693,12 +1708,16 @@ function renderRecBox(){
 }
 async function doRecord(){if(!recState)return;recState.phase="rec";renderRecBox();
   const bar=$("#recBar");if(bar){bar.style.transition="width 1.5s linear";requestAnimationFrame(()=>requestAnimationFrame(()=>bar.style.width="100%"));}
-  try{const blob=await recordClip(1500);lastErr="";if(!recState)return;recState.blob=blob;recState.phase="review";renderRecBox();if(lastClip&&lastClip.peak>=0.01)previewBlob(blob);}
+  try{const blob=await recordClip(1500,m=>{const l=$("#lvlBar");if(l)l.style.width=Math.min(100,Math.round(m*140))+"%";});lastErr="";if(!recState)return;
+    recState.blob=lastClip.via==="none"?null:blob;recState.phase="review";renderRecBox();if(recState.blob)previewBlob(blob);}
   catch(e){console.warn(e);lastErr=(e&&(e.message||e.name))||"error";toast("Recording didn't work. Try again.");if(recState){recState.phase="ready";renderRecBox();}}}
-function clipNote(){if(!lastClip)return"";const pct=Math.round(lastClip.peak*100);
-  return lastClip.peak<0.01?`<b style="color:var(--berryDeep)">I didn't hear anything (loudness ${pct}%). Check that the microphone is allowed, then try again a bit closer.</b>`
-    :`<span class="small">Recorded ${lastClip.secs.toFixed(1)} s · loudness ${pct}%${pct<8?" (quiet: try a little closer)":" ✓"}</span>`;}
-async function previewBlob(blob){const id="__preview";audio();REC.set(id,blob);BUF.delete(id);const b=await bufFor(id);REC.delete(id);BUF.delete(id);
+function clipNote(){const c=lastClip;if(!c)return"";const pc=x=>Math.min(100,Math.round((x||0)*100))+"%";
+  const detail=`<span class="small" style="opacity:.8">Mic check: live level ${pc(c.live)} · samples ${pc(c.pcm)} · recorder ${Math.round(c.mrBytes/1024)} KB${c.mrPeak!=null?" ("+pc(c.mrPeak)+")":""}${c.mrErr?" ("+esc(c.mrErr)+")":""} · audio ${esc(c.state)}</span>`;
+  if(c.via==="none")return `<b style="color:var(--berryDeep)">I didn't hear anything.</b><span class="small">The microphone is on, but no sound came through. Try once more, a little closer. If it happens again, tell Claude the “Mic check” line below.</span>`+detail;
+  if(c.via==="recorder-file")return `<span class="small">Saved with the iPad's own recorder. Tap “Hear it again” to check it.</span>`+detail;
+  return `<span class="small">Recorded ${c.secs.toFixed(1)} s · loudness ${pc(c.peak)}${c.peak<0.08?" (quiet: try a little closer)":" ✓"}</span>`+detail;}
+async function previewBlob(blob){if(!blob)return;audio();if(!/wav/.test(blob.type||""))return playEl(blob);
+  const id="__preview";REC.set(id,blob);BUF.delete(id);const b=await bufFor(id);REC.delete(id);BUF.delete(id);
   if(b)playBuf(b);else toast("That one was silent. Try again a little louder.");}
 function advanceRec(){if(!recState)return;recState.i++;recState.blob=null;recState.phase="ready";
   if(recState.i>=recState.queue.length){stopRecorder();toast("All recorded!");renderSounds();return;}renderSounds();}
